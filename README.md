@@ -1,0 +1,1 @@
+# PTSator is an AAC Segments PTS Validator

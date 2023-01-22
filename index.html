@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PTSator: PTS Validator for Audio HLS Playlists</title>
+    <style>
+        html,
+        body {
+            background-color: var(--gray-12);
+
+            color: var(--gray-0);
+            font-family: var(--font-mono);
+        }
+
+        body {
+            width: max-content;
+            margin: 0 auto;
+        }
+
+        form {
+            display: grid;
+        }
+
+        input,
+        textarea,
+        button,
+        pre {
+            border: none;
+            padding: var(--size-2);
+        }
+
+        input {
+            border-radius: var(--radius-2) var(--radius-2) 0 0;
+        }
+
+        button {
+            background-color: var(--green-8);
+            border-radius: 0 0 var(--radius-2) var(--radius-2);
+
+            color: var(--gray-0);
+            font-size: var(--font-size-3);
+            font-weight: bold;
+            text-transform: uppercase;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background-color: var(--green-7);
+        }
+
+        pre {
+            background-color: var(--gray-11);
+            border: dashed 2px;
+            border-radius: var(--radius-2);
+
+            font-family: inherit;
+            color: var(--green-3);
+        }
+
+        .result--error {
+            color: var(--red-3);
+        }
+    </style>
+    <link rel="stylesheet" href="https://unpkg.com/open-props">
+    <link rel="stylesheet" href="https://unpkg.com/prismjs@v1.x/themes/prism-okaidia.css">
+</head>
+
+<body>
+    <header>
+        <h1>AAC Segments PTS Validator</h1>
+        <p>
+            Detection of a drop in the PTS value in an HLS audio playlist or an AAC file list.
+        </p>
+    </header>
+
+    <main>
+        <form>
+            <input type="url" name="url" id="url" placeholder="https://example.com/playlist.m3u8"
+                title="HLS playlist URL">
+            <textarea name="segment" id="segment" cols="80" rows="10" placeholder="https://example.com/audio-1.aac,
+https://example.com/audio-2.aac,
+https://example.com/audio-3.aac,
+https://example.com/audio-4.aac" title="AAC file list"></textarea>
+            <button class="validate">validate</button>
+        </form>
+
+        <pre class="result"><code class="language-js"></code></pre>
+    </main>
+    <script src="https://unpkg.com/prismjs@v1.x/components/prism-core.min.js"></script>
+    <script src="https://unpkg.com/prismjs@v1.x/plugins/autoloader/prism-autoloader.min.js"></script>
+    <script>
+        const ONE_SECOND_IN_TS = 90000; // 90kHz clock
+
+        /**
+         * Adjust ID3 tag or caption timing information by the timeline pts values
+         * (if keepOriginalTimestamps is false) and convert to seconds
+        */
+        const metadataTsToSeconds = (timestamp, timelineStartPts) => {
+            return (timestamp - timelineStartPts) / ONE_SECOND_IN_TS;
+        };
+
+        const evaluatePTS = (uint8 = []) => {
+            let pts = ((uint8[68] & 0x01) << 30) |
+                (uint8[69] << 22) |
+                (uint8[70] << 14) |
+                (uint8[71] << 6) |
+                (uint8[72] >>> 2);
+
+            pts *= 4;
+            pts += uint8[73] & 0x03;
+
+            return pts;
+        }
+
+        const fetchPlaylist = (url) => {
+            const baseURL = url.replace(/\/[\w]*.m3u8/, '/');
+
+            return fetch(url)
+                .then(r => r.text())
+                .then(m3u8 => m3u8.trim().split('\n'))
+                .then(lines => lines.filter(line => !line.startsWith('#')))
+                .then(chunks => chunks.map(chunk => `${baseURL}${chunk}`))
+        }
+
+        const fetchChunks = (urls = [], log = false) => {
+            const promises = [];
+
+            urls.forEach((url, index) => {
+                promises.push(fetch(url)
+                    .then(async r => ({ requestStatus: r.status, buffer: await r.arrayBuffer() }))
+                    .then(({ requestStatus, buffer }) => {
+                        let uint8 = new Uint8Array(buffer);
+                        let pts = evaluatePTS(uint8);
+                        const rawPts = uint8.slice(68, 73 + 1);
+
+                        if (log) {
+                            console.log(String.fromCharCode(...uint8))
+                            console.log(String.fromCharCode(...rawPts))
+                        }
+                        return { index, requestStatus, pts, url, rawPts };
+                    }))
+            })
+
+            return Promise.allSettled(promises);
+        };
+
+        const mapChunksEstimateCueTime = (chunks = []) => {
+            let timelineStartPts = false;
+
+            return chunks.map(({ status, value: { index, requestStatus, pts, url, rawPts } = {} }) => {
+                if (!timelineStartPts) {
+                    timelineStartPts = pts;
+                }
+
+                return {
+                    index,
+                    status,
+                    requestStatus,
+                    cueTime: metadataTsToSeconds(pts, timelineStartPts),
+                    pts,
+                    timelineStartPts,
+                    rawPts,
+                    url,
+                }
+            })
+        };
+
+        const numberOfChunksToShowBeforeAndAfterError = (chunks = [], numberOfChunksToShow = 2) => {
+            if (numberOfChunksToShow === -1) return chunks;
+
+            const badCueTimeIndex = chunks.findIndex(({ cueTime }) => cueTime < 0);
+
+            if (badCueTimeIndex === -1) {
+                return {
+                    status: "No errors",
+                    chunks
+                }
+            }
+
+            const from = badCueTimeIndex - numberOfChunksToShow;
+            const to = badCueTimeIndex + numberOfChunksToShow + 1;
+
+            return {
+                status: `Error`,
+                message: `Error found at index ${badCueTimeIndex}`,
+                chunks: chunks.slice(from, to)
+            }
+        }
+
+        const validateBtn = document.querySelector('.validate');
+        const urlInput = document.querySelector('#url');
+        const segmentTextArea = document.querySelector('#segment');
+        const resultPre = document.querySelector('.result');
+        const resultCode = document.querySelector('.language-js');
+        const url = new URL(location.toString());
+
+        const displayResult = (result) => {
+            resultPre.classList.toggle('result--error', result.status === 'Error');
+            resultCode.innerHTML = Prism.highlight(JSON.stringify(result, undefined, 2), Prism.languages.javascript, 'javascript');
+
+            return result;
+        }
+
+        const validateSegments = (segments) => fetchChunks(segments)
+            .then(mapChunksEstimateCueTime)
+            .then(numberOfChunksToShowBeforeAndAfterError)
+            .then(displayResult)
+
+        const parseTextArea = (text) => {
+            return text
+                .trim()
+                .replaceAll('\n', '')
+                .split(',')
+                .filter(value => value);
+        }
+
+        document.querySelector('.validate').addEventListener('click', (e) => {
+            e.preventDefault();
+
+            displayResult({
+                status: 'Loading',
+                message: 'Content is loading...'
+            });
+
+            if (!urlInput.value && !segmentTextArea.value) {
+                displayResult({
+                    status: 'Error',
+                    message: 'Data missing'
+                });
+
+                return;
+            }
+
+            if (urlInput.value.trim()) {
+                fetchPlaylist(urlInput.value).then(validateSegments)
+                return;
+            }
+
+            const segments = parseTextArea(segmentTextArea.value);
+
+            if (segments.length) {
+                validateSegments(segments);
+            }
+        });
+    </script>
+</body>
+
+</html>
