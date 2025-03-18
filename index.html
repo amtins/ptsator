@@ -116,7 +116,7 @@ https://example.com/audio-4.aac" title="AAC file list"></textarea>
         }
 
         const fetchPlaylist = (url) => {
-            const baseURL = url.replace(/\/[\w]*.m3u8/, '/');
+            const baseURL = url.replace(/\/[\w-]*.m3u8/, '/');
 
             return fetch(url)
                 .then(r => r.text())
